@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+nvda_darliq_fit.png
+nvda_darliq_fit.csv
+nvda_raw.csv
