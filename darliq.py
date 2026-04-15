@@ -1,29 +1,25 @@
 """
 DArLiQ model
 
-Amihud illiquidity measure:
-    l_t = |R_t| / V_t
-Price impact per unit of trading volume. Larger l_t => worse liquidity.
+Variables (code name <-> math symbol)
+    l           l_t        Amihud illiquidity  |R_t| / V_t
+    u           u_t        rescaled time t / T  in (0, 1]
+    g           g(u_t)     long-run trend, nonparametric
+    lam         lambda_t   short-run autoregressive component
+    l_star      l*_t       detrended liquidity  l_t / g(u_t)
+    zeta        zeta_t     iid shock  l*_t / lambda_t
+    beta, gamma            AR / innovation coefficients of lam
+    k                      Weibull shape of zeta
+    h                      kernel bandwidth
 
-DArLiQ multiplicative decomposition:
-    l_t = g(t/T) * lambda_t * zeta_t
+Equations
+    l_t       = g(u_t) * lambda_t * zeta_t
+    lambda_t  = (1 - beta - gamma) + beta * lambda_{t-1} + gamma * l*_{t-1}
+    l*_t      = l_t / g(u_t) = lambda_t * zeta_t
 
-  g(t/T) : long-run trend, nonparametric (no assumed functional form),
-           E(l_t) = g(t/T).
-
-  lambda_t : short-run dynamics, analogous to the conditional variance
-             in GARCH(1, 1),
-                 lambda_t = (1 - beta - gamma) + beta * lambda_{t-1}
-                                                + gamma * l*_{t-1},
-             where omega = 1 - beta - gamma is pinned down by the
-             constraint E(lambda_t) = 1. We need this because g and
-             lambda_t are only identified up to a multiplicative
-             constant; fixing E(lambda_t) = 1 resolves this.
-
-  Detrended liquidity:
-                 l*_t = l_t / g(t/T) = lambda_t * zeta_t.
-
-  zeta_t : random shock, unpredictable, E(zeta_t | F_{t-1}) = 1.
+Identification
+    E(lambda_t) = 1   ->   omega = 1 - beta - gamma
+    E(zeta_t)   = 1   ->   Weibull scale = 1 / Gamma(1 + 1/k)
 """
 
 import numpy as np

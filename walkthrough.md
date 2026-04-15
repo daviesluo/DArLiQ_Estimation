@@ -1,108 +1,290 @@
 # DArLiQ 代码逐行解读
 
-本文档配合 `darliq.py` 与 `run_nvda.py`。每一节都按"先讲数学要做什么 → 再讲代码具体怎么做 → 最后逐行拆解 Python 语法"的顺序写。如果你某一行看不懂，先回到本节开头的数学说明。
+本文档配合 `darliq.py` 与 `run_nvda.py`，逐行解释代码 *写法* 以及它对应的数学量。
+模型的数学动机、推导、识别约束等内容请看我的 TeX 笔记，本文不再重复。
+
+## 0. 符号速查
+
+| 代码 | 数学 | 含义 |
+|------|------|------|
+| `l`        | $\ell_t$       | Amihud illiquidity $|R_t|/V_t$ |
+| `u`        | $u_t = t/T$    | 重标度时间 |
+| `h`        | $h$            | 核带宽 |
+| `g`        | $g(u_t)$       | 长期趋势 |
+| `lam`      | $\lambda_t$    | 短期 AR 成分 |
+| `l_star`   | $\ell^{*}_t$   | 去趋势流动性 $\ell_t/g(u_t)=\lambda_t\zeta_t$ |
+| `zeta`     | $\zeta_t$      | 残差冲击 |
+| `beta`,`gamma` | $\beta,\gamma$ | $\lambda_t$ 的两个系数 |
+| `k`        | $k$            | Weibull shape |
 
 ---
 
-## 1. 模型
+## 1. `darliq.py`
 
-### 1.1 Amihud 流动性指标
+### 1.1 imports（line 29–31）
 
-$$
-\ell_t \;=\; \frac{|R_t|}{V_t}
-$$
+```python
+import numpy as np
+from scipy.optimize import minimize
+from scipy.special import gamma as gamma_func
+```
 
-- $R_t$：第 $t$ 天的日收益率（close-to-close）。
-- $V_t$：第 $t$ 天的成交量（论文里用美元成交额 $P_t V_t$，更标准）。
-- $\ell_t$ 衡量每 1 单位成交"撬动"了多少价格变动：分母（成交量）越大、分子（价格变动幅度）越小，市场越深、越能吸收订单不留下痕迹，$\ell_t$ 就越小。所以 **$\ell_t$ 越大代表流动性越差**。这是一个 **illiquidity** 指标，不是 liquidity 指标，名字里特意带了"il-"。
-
-### 1.2 DArLiQ 乘法分解
-
-论文把整条 $\ell_t$ 序列分成三个相乘的部分：
-
-$$
-\ell_t \;=\; g(t/T)\;\cdot\;\lambda_t\;\cdot\;\zeta_t
-$$
-
-每一个组件分别承担不同时间尺度上的变化：
-
-#### (a) 长期趋势 $g(t/T)$
-
-- **角色**：刻画"几年级别"的慢变化。比如 NVDA 这种从 1999 年的小盘股一路涨成万亿市值，流动性会显著改善（$\ell_t$ 整体下行），$g(t/T)$ 就把这个慢漂移抓住。
-- **形式**：完全 **非参数**——不假设它是直线、指数、多项式或者任何具体函数族，只假设它是关于"重标度时间" $u = t/T \in (0, 1]$ 的一条光滑曲线。
-- **统计含义**：它是 $\ell_t$ 的时变无条件均值，
-$$
-\mathbb{E}(\ell_t) \;=\; g(t/T).
-$$
-也就是说，如果你站在第 $t$ 天往这个未来一段时间内平均 $\ell_t$，平均值会在 $g(t/T)$ 附近。
-- **为什么用"重标度时间" $t/T$ 而不是日历时间 $t$**：当样本量 $T$ 增长时，$t/T$ 始终落在 $(0, 1]$ 内，使我们能用核平滑的渐近理论。这是 Robinson、Cai 等人非参数回归里"locally stationary"的标准技巧。
-
-#### (b) 短期自回归成分 $\lambda_t$
-
-- **角色**：刻画"日级别"的持续性。今天流动性差，明天大概率也差一点（市场冲击的短记忆）。
-- **形式**：和 GARCH(1,1) 几乎一样的递推：
-$$
-\lambda_t \;=\; \underbrace{(1 - \beta - \gamma)}_{\omega} \;+\; \beta\,\lambda_{t-1} \;+\; \gamma\,\ell^{*}_{t-1}
-$$
-其中 $\ell^{*}_{t-1}$ 是去趋势后的流动性（见 (d)），$\beta, \gamma \ge 0$ 且 $\beta + \gamma < 1$ 保证弱平稳。
-  - 这个结构和 GARCH 的 $\sigma^2_t = \omega + \beta\sigma^2_{t-1} + \gamma\varepsilon^2_{t-1}$ 完全平行：把 $\sigma^2_t$ 换成 $\lambda_t$，把 $\varepsilon^2_{t-1}$ 换成上一期的去趋势流动性 $\ell^{*}_{t-1}$。
-  - $\beta$ 大表示"自己惯性强"——昨天的 $\lambda$ 被大幅继承到今天；$\gamma$ 大表示"对最新冲击反应快"。两个加起来越接近 1，记忆衰减越慢，序列越接近单位根。
-- **常数项的来历——识别约束**：原本 $\lambda_t$ 的常数项是个独立参数 $\omega > 0$。可是注意到，如果我们把 $g$ 和 $\lambda$ 同时乘以 / 除以一个正数 $c$：
-$$
-\ell_t = g \cdot \lambda \cdot \zeta = (cg)\cdot(\lambda/c)\cdot\zeta,
-$$
-得到完全一样的 $\ell_t$，所以 $g$ 和 $\lambda$ 之间存在一个尺度上的歧义——它们只能被识别"到一个常数倍数"。为了把这个自由度钉死，论文规定
-$$
-\mathbb{E}(\lambda_t) \;=\; 1.
-$$
-对递推式两边取期望、用 $\mathbb{E}(\ell^{*}_{t-1}) = \mathbb{E}(\lambda_{t-1})\cdot 1 = 1$（最后一步因为 $\zeta_t$ 条件均值为 1）：
-$$
-1 \;=\; \omega + \beta\cdot 1 + \gamma\cdot 1
-\quad\Longrightarrow\quad
-\omega \;=\; 1 - \beta - \gamma.
-$$
-所以 $\omega$ 不是自由参数，自由参数只剩 $(\beta, \gamma)$ 两个。**这一约束在代码里写成 `omega = 1.0 - beta - gamma`，这一行就是论文 Section 2 里那句"set $\omega = 1 - \beta - \gamma$"的全部含义**。
-
-#### (c) 残差冲击 $\zeta_t$
-
-- **角色**：把所有 $g$ 和 $\lambda_t$ 没解释完的"今天独有的随机扰动"装进去。
-- **形式**：非负随机变量，$\mathbb{E}(\zeta_t \mid \mathcal{F}_{t-1}) = 1$（过去信息预测不了它的均值，唯一能保证的是它平均等于 1）。
-  - 单位均值的设定再次保证了 $g$、$\lambda$、$\zeta$ 三者的尺度被钉死：$g$ 锁住"水平"，$\lambda$ 锁住"短期均值偏离"，$\zeta$ 锁住"随机噪声"。
-  - 在 Step 2a (GMM) 里我们 **只用** 这一条 $\mathbb{E}(\zeta_t \mid \mathcal{F}_{t-1}) = 1$，不假设它具体服从什么分布。
-  - 在 Step 2b (Weibull MLE) 里我们再 **额外** 假设 $\zeta_t \stackrel{\text{iid}}{\sim} \text{Weibull}(k)$（一个一参数族），用全部分布信息来提高估计效率。
-
-#### (d) 去趋势流动性 $\ell^{*}_t$
-
-把 $\ell_t$ 除掉 $g(t/T)$ 得到
-$$
-\ell^{*}_t \;=\; \frac{\ell_t}{g(t/T)}
-\;=\; \frac{g(t/T)\,\lambda_t\,\zeta_t}{g(t/T)}
-\;=\; \lambda_t\,\zeta_t.
-$$
-
-- **为什么要除掉 $g$**：原始的 $\ell_t$ 因为 $g(t/T)$ 漂移，所以它的均值随时间变化，是非平稳的。一个均值都在动的序列没法用一组固定参数 $(\beta, \gamma)$ 去拟合自回归——$\lambda_t$ 永远在追一个会跑的目标。把 $g$ 除掉之后，$\ell^{*}_t = \lambda_t \zeta_t$ 的无条件均值变成常数 $\mathbb{E}(\ell^{*}_t) = \mathbb{E}(\lambda_t)\mathbb{E}(\zeta_t) = 1\cdot 1 = 1$，所以 $\ell^{*}_t$ 是均值平稳的，可以套用一组固定的 $(\beta, \gamma)$。
-- **直观理解**：$g$ 解决"几年级别"的尺度；$\ell^{*}_t = \lambda_t \zeta_t$ 解决"日级别"的波动；接下来 $\lambda_t$ 解决"日级别但有持续性"那一块；剩下的 $\zeta_t$ 才是"今天独有的、和昨天独立的"噪声。三层时间尺度依次剥离。
-
-### 1.3 总览：要估计什么、按什么顺序估
-
-| Step | 估计对象 | 工具 | 关键假设 |
-|------|----------|------|----------|
-| 1    | $g(t/T)$ | 局部线性核平滑 | $g$ 是光滑函数 |
-| 2a   | $(\beta, \gamma)$ | GMM（最小化 $(\ell^{*}_t - \lambda_t)^2$） | 一阶条件矩 $\mathbb{E}(\zeta_t\mid\mathcal{F}_{t-1}) = 1$ |
-| 2b   | $(\beta, \gamma, k)$ | Weibull 最大似然 | $\zeta_t \stackrel{\text{iid}}{\sim} \text{Weibull}(k)$，且 $\mathbb{E}(\zeta_t)=1$ |
-
-每一步都把上一步的输出作为输入。Step 1 给出 $\widehat{g}$；Step 2a 用 $\widehat{g}$ 去算 $\ell^{*}_t$、再估 $(\beta, \gamma)$；Step 2b 从 Step 2a 的解出发，让似然把 $(\beta, \gamma)$ 微调一下并多估一个 shape 参数 $k$。
-
-代码里还做了一次"refined trend"：拿到 $\widehat{\lambda}_t$ 之后，把 $\ell_t / \widehat{\lambda}_t$ 再核平滑一遍得到 $\widetilde{g}$，相当于先用初步 $\lambda$ 去掉短期波动再来估趋势——这一步同样在论文 Step 1 的范围内。
+- `numpy` 提供向量化数组运算，本文件里所有 `np.xxx` 都是它。
+- `from scipy.optimize import minimize`：带约束/边界的通用数值最优化器，下面 GMM 和 MLE 都用它。
+- `from scipy.special import gamma as gamma_func`：Gamma 函数 $\Gamma(\cdot)$。这里用 `as gamma_func` 改名，是为了避免和 DArLiQ 模型里的参数名 `gamma`（$\gamma$）冲突。
 
 ---
 
-> **下一节预告**：`darliq.py` 的逐行解读，包括
-> - 高斯核为什么写成 `np.exp(-0.5 * z**2) / np.sqrt(2*np.pi)`
-> - 局部线性回归的闭式解 $(s_0, s_1, s_2, t_0, t_1)$ 是怎么从最小二乘法一路推出来的，每一行 `numpy` 语句对应数学公式里的哪个量
-> - `lambda_recursion` 为什么必须用 `for` 循环而不能向量化
-> - `gmm_estimate` 里那个 `def obj(theta):` 嵌套函数、`SLSQP`、`bounds` / `constraints` 字典、`lambda x:` 各自是什么意思
-> - Weibull 概率密度的对数表达式是怎么从 $f(x) = (k/\lambda)(x/\lambda)^{k-1}\exp(-(x/\lambda)^k)$ 一步步推出来的
-> - 负对数似然里那两个负号怎么来的
->
-> 你确认这一节没问题之后，告诉我"继续 darliq"，我就把第二节写出来。
+### 1.2 `gaussian_kernel`（line 34–35）
+
+```python
+def gaussian_kernel(z):
+    return np.exp(-0.5 * z ** 2) / np.sqrt(2.0 * np.pi)
+```
+
+实现标准正态密度
+
+$$
+K(z)\;=\;\frac{1}{\sqrt{2\pi}}\exp\!\Big(-\tfrac{1}{2}z^{2}\Big).
+$$
+
+- `z` 通常是 numpy 数组；numpy 的逐元素运算让函数自动 vectorize，不需要写 `for`。
+- `z ** 2` 是 Python 的乘方运算符 $z^2$。
+- `np.exp(...)` 对数组 *逐元素* 求 $e^{(\cdot)}$。
+- `np.sqrt(2.0 * np.pi)` 就是常数 $\sqrt{2\pi}$。`2.0` 写成浮点数是为了让结果是 `float` 而不是 `int`。
+
+---
+
+### 1.3 `local_linear`（line 38–55）
+
+```python
+def local_linear(u_eval, u_data, y, h):
+    g_hat = np.empty_like(u_eval, dtype=float)
+    for i, u in enumerate(u_eval):
+        d = u_data - u
+        w = gaussian_kernel(d / h) / h
+        s0 = w.sum()
+        s1 = (w * d).sum()
+        s2 = (w * d ** 2).sum()
+        t0 = (w * y).sum()
+        t1 = (w * d * y).sum()
+        g_hat[i] = (s2 * t0 - s1 * t1) / (s0 * s2 - s1 ** 2)
+    return g_hat
+```
+
+实现的就是局部线性核回归
+
+$$
+\widehat{g}(u)\;=\;\widehat{a},\qquad
+(\widehat{a},\widehat{b})\;=\;\arg\min_{a,b}\sum_{t=1}^{T}K_h(u_t-u)\,\big(y_t - a - b(u_t-u)\big)^{2}.
+$$
+
+闭式解为
+
+$$
+\widehat{a}\;=\;\frac{S_2 T_0 - S_1 T_1}{S_0 S_2 - S_1^{2}},
+\quad
+S_j\;=\;\sum_t w_t(u_t-u)^j,
+\quad
+T_j\;=\;\sum_t w_t (u_t-u)^j y_t.
+$$
+
+逐行：
+
+- `def local_linear(u_eval, u_data, y, h):`
+  - `u_eval`：要在哪些点 $u$ 上估出 $\widehat{g}(u)$；
+  - `u_data`：样本时间 $u_1,\dots,u_T$；
+  - `y`：被平滑的序列（这里就是 $\ell_t$）；
+  - `h`：带宽 $h$。
+- `g_hat = np.empty_like(u_eval, dtype=float)`：开一块和 `u_eval` 同 shape 的浮点数组，准备装结果。`np.empty_like` 比 `np.zeros_like` 略快，因为不初始化。
+- `for i, u in enumerate(u_eval):`：`enumerate` 同时给出下标 `i` 和元素 `u`，等价于 `for i in range(len(u_eval)): u = u_eval[i]`。
+- `d = u_data - u`：numpy 的广播自动把标量 `u` 减到向量 `u_data` 的每一个元素上，得到 $d_t = u_t - u$。
+- `w = gaussian_kernel(d / h) / h`：核权 $w_t = K_h(u_t-u) = \tfrac{1}{h}K\!\big(\tfrac{u_t-u}{h}\big)$。注意外层那个 `/ h` 不能漏，那是 $K_h$ 定义里的 $1/h$。
+- `s0 = w.sum()`：$S_0 = \sum_t w_t$。
+- `s1 = (w * d).sum()`：$S_1 = \sum_t w_t d_t$。`w * d` 是逐元素乘，`.sum()` 求和。
+- `s2 = (w * d ** 2).sum()`：$S_2 = \sum_t w_t d_t^2$。运算优先级：`d ** 2` 先算，再 `w * (...)`。
+- `t0 = (w * y).sum()`：$T_0 = \sum_t w_t y_t$。
+- `t1 = (w * d * y).sum()`：$T_1 = \sum_t w_t d_t y_t$（三个数组逐元素相乘，再求和）。
+- `g_hat[i] = (s2 * t0 - s1 * t1) / (s0 * s2 - s1 ** 2)`：把闭式解 $\widehat{a}$ 写出来，存进当前位置 `i`。
+- `return g_hat`：返回长度等于 `len(u_eval)` 的估计向量。
+
+复杂度是 $\mathcal O(T \cdot |\texttt{u\_eval}|)$；`u_eval = u_data` 时是 $\mathcal O(T^2)$，对几千天的样本足够快。
+
+---
+
+### 1.4 `lambda_recursion`（line 58–70）
+
+```python
+def lambda_recursion(theta, l_star):
+    beta, gamma = theta
+    omega = 1.0 - beta - gamma
+    T = len(l_star)
+    lam = np.empty(T)
+    lam[0] = 1.0
+    for t in range(1, T):
+        lam[t] = omega + beta * lam[t - 1] + gamma * l_star[t - 1]
+    return lam
+```
+
+实现递推
+
+$$
+\lambda_t\;=\;\omega + \beta\lambda_{t-1} + \gamma\,\ell^{*}_{t-1},
+\qquad \omega\;=\;1-\beta-\gamma,
+$$
+
+初值 $\lambda_0 = 1$（无条件均值）。
+
+- `beta, gamma = theta`：tuple unpacking。`theta` 是长度 2 的元组/数组，等价于 `beta = theta[0]; gamma = theta[1]`。
+- `omega = 1.0 - beta - gamma`：把识别约束直接写死，省一个自由参数。
+- `T = len(l_star)`：样本长度。
+- `lam = np.empty(T)`：开一块未初始化的长度 $T$ 数组。
+- `lam[0] = 1.0`：递推起点。
+- `for t in range(1, T):` … 这个 `for` 循环 **不能** 向量化，因为 `lam[t]` 依赖刚刚算出来的 `lam[t-1]`，是严格的串行依赖。numpy 没有内置的"扫描"操作。
+- 返回的 `lam` 即 $(\lambda_1,\dots,\lambda_T)$。
+
+---
+
+### 1.5 `gmm_estimate`（line 73–90）
+
+```python
+def gmm_estimate(l_star, theta0=(0.85, 0.10)):
+    def obj(theta):
+        lam = lambda_recursion(theta, l_star)
+        return np.mean((l_star - lam) ** 2)
+
+    eps = 1e-4
+    bounds = [(eps, 1 - eps), (eps, 1 - eps)]
+    cons = {'type': 'ineq', 'fun': lambda x: 1 - eps - x[0] - x[1]}
+    res = minimize(obj, np.asarray(theta0), method='SLSQP',
+                   bounds=bounds, constraints=cons)
+    return res.x
+```
+
+数值上等价于最小化
+
+$$
+Q(\beta,\gamma)\;=\;\frac{1}{T}\sum_{t=1}^{T}\big(\ell^{*}_t-\lambda_t(\beta,\gamma)\big)^{2}
+$$
+
+在约束 $\beta,\gamma\in(0,1)$ 且 $\beta+\gamma<1$ 下。
+
+- `def obj(theta):` 是嵌套在 `gmm_estimate` 内部的 *闭包*：它能直接看到外层局部变量 `l_star`，所以不用作为参数传进去。
+  - `lam = lambda_recursion(theta, l_star)`：用候选 $(\beta,\gamma)$ 算出 $\lambda_t$ 序列。
+  - `return np.mean((l_star - lam) ** 2)`：均方残差 $\tfrac{1}{T}\sum(\ell^{*}_t-\lambda_t)^2$。
+- `eps = 1e-4`：把 0 / 1 边界往里收一点，避免 $\beta+\gamma$ 卡到边界产生数值病。
+- `bounds = [(eps, 1 - eps), (eps, 1 - eps)]`：两个参数各自的 box 约束 $\beta\in[\varepsilon,1-\varepsilon]$、$\gamma\in[\varepsilon,1-\varepsilon]$。
+- `cons = {'type': 'ineq', 'fun': lambda x: 1 - eps - x[0] - x[1]}`：scipy 的不等式约束格式要求 `fun(x) >= 0`，这里就是 $1-\varepsilon-\beta-\gamma\ge 0$，即 $\beta+\gamma\le 1-\varepsilon$。`lambda x: ...` 是匿名函数。
+- `res = minimize(obj, np.asarray(theta0), method='SLSQP', bounds=bounds, constraints=cons)`：调用 SLSQP（Sequential Least SQuares Programming），它是 scipy 里少数同时支持 *bounds + 不等式约束* 的方法。`np.asarray(theta0)` 把元组转成 numpy 数组当初值。
+- `return res.x`：`res` 是 `OptimizeResult`，`res.x` 是最优解 $(\widehat{\beta},\widehat{\gamma})$。
+
+---
+
+### 1.6 `_weibull_logpdf`（line 93–97）
+
+```python
+def _weibull_logpdf(zeta, k):
+    scale = 1.0 / gamma_func(1.0 + 1.0 / k)
+    return (np.log(k) - k * np.log(scale)
+            + (k - 1.0) * np.log(zeta) - (zeta / scale) ** k)
+```
+
+Weibull$(k,\sigma)$ 的密度
+
+$$
+f(x;k,\sigma)\;=\;\frac{k}{\sigma}\Big(\frac{x}{\sigma}\Big)^{k-1}\exp\!\Big(-\big(x/\sigma\big)^{k}\Big),\qquad x>0,
+$$
+
+取对数
+
+$$
+\log f(x)\;=\;\log k - \log\sigma + (k-1)\log\!\frac{x}{\sigma} - \Big(\frac{x}{\sigma}\Big)^{k}
+\;=\;\log k - k\log\sigma + (k-1)\log x - (x/\sigma)^{k}.
+$$
+
+要求 $\mathbb{E}(\zeta)=1$，而 $\mathbb{E}(\text{Weibull}(k,\sigma))=\sigma\,\Gamma(1+1/k)$，所以 $\sigma = 1/\Gamma(1+1/k)$。
+
+- 函数名前缀下划线 `_weibull_logpdf` 是 Python 约定里的"内部使用"标记，不打算被外部 import。
+- `scale = 1.0 / gamma_func(1.0 + 1.0 / k)`：算 $\sigma$。
+- 返回式严格对应 $\log k - k\log\sigma + (k-1)\log\zeta - (\zeta/\sigma)^k$。`zeta` 是数组，所有运算都是逐元素。
+- 注意：`np.log(k)` 是 $\log k$（标量），但 numpy 自动广播到与 `np.log(zeta)` 形状一致的数组上。
+
+---
+
+### 1.7 `neg_loglik_weibull`（line 100–110）
+
+```python
+def neg_loglik_weibull(params, l_star):
+    beta, gamma, k = params
+    lam = lambda_recursion((beta, gamma), l_star)
+    zeta = l_star / lam
+    log_f = _weibull_logpdf(zeta, k)
+    return -np.sum(-np.log(lam) + log_f)
+```
+
+模型条件密度通过雅可比变换得到：因为 $\zeta_t = \ell^{*}_t/\lambda_t$，
+
+$$
+p(\ell^{*}_t\mid\mathcal F_{t-1})\;=\;\frac{1}{\lambda_t}\,f_k\!\big(\ell^{*}_t/\lambda_t\big),
+\qquad
+\log p(\ell^{*}_t\mid\mathcal F_{t-1})\;=\;-\log\lambda_t+\log f_k(\zeta_t).
+$$
+
+负对数似然
+
+$$
+-\,\ell\ell(\beta,\gamma,k)\;=\;-\sum_{t=1}^{T}\big(-\log\lambda_t+\log f_k(\zeta_t)\big).
+$$
+
+- `beta, gamma, k = params`：3 维 unpack。
+- `lam = lambda_recursion((beta, gamma), l_star)`：用前两个参数走递推。把 `(beta, gamma)` 包成元组传进去，因为 `lambda_recursion` 期望长度 2 的 `theta`。
+- `zeta = l_star / lam`：逐元素除，得到 $\widehat{\zeta}_t$。
+- `log_f = _weibull_logpdf(zeta, k)`：长度 $T$ 的 $\log f_k(\zeta_t)$ 数组。
+- `return -np.sum(-np.log(lam) + log_f)`：里层括号里那个负号来自雅可比 $-\log\lambda_t$；外层那个负号是把 $\ell\ell$ 翻成 $-\ell\ell$ 给最小化器。这两个负号方向不一样，*不会* 互相抵消。
+
+---
+
+### 1.8 `ml_weibull_estimate`（line 113–124）
+
+```python
+def ml_weibull_estimate(l_star, theta0, k0=1.2):
+    eps = 1e-4
+    x0 = np.array([theta0[0], theta0[1], k0])
+    bounds = [(eps, 1 - eps), (eps, 1 - eps), (0.2, 10.0)]
+    cons = {'type': 'ineq', 'fun': lambda x: 1 - eps - x[0] - x[1]}
+    res = minimize(neg_loglik_weibull, x0, args=(l_star,),
+                   method='SLSQP', bounds=bounds, constraints=cons)
+    return res.x, -res.fun
+```
+
+最大化对数似然 $\ell\ell(\beta,\gamma,k)$，等价于最小化 `neg_loglik_weibull`。
+
+- `theta0` 是 GMM 解出来的 $(\widehat\beta,\widehat\gamma)$，从那里热启动。
+- `k0 = 1.2`：shape 的初值。
+- `x0 = np.array([theta0[0], theta0[1], k0])`：3 维参数初值。
+- `bounds`：前两位 box 同 GMM；第三位 $k\in[0.2,10]$。
+- `cons` 同 GMM，仍是 $\beta+\gamma\le 1-\varepsilon$。注意 lambda 里只用了 `x[0]+x[1]`，`k=x[2]` 不在这条约束里。
+- `args=(l_star,)`：把 `l_star` 作为额外参数传给 `neg_loglik_weibull`。`(l_star,)` 末尾的逗号是为了把它写成单元素元组，没有逗号 `(l_star)` 只是普通括号。
+- 返回 `(res.x, -res.fun)`：参数估计和真正的对数似然值（`res.fun` 是 *负* 对数似然，要再翻一次符号）。
+
+---
+
+### 1.9 `refined_trend`（line 127–129）
+
+```python
+def refined_trend(u_eval, u_data, l, lam_hat, h):
+    return local_linear(u_eval, u_data, l / lam_hat, h)
+```
+
+把被平滑的 `y` 由 $\ell_t$ 换成 $\ell_t/\widehat\lambda_t$，相当于
+
+$$
+\widetilde{g}(u)\;=\;\widehat{a},\quad
+(\widehat a,\widehat b)\;=\;\arg\min_{a,b}\sum_t K_h(u_t-u)\Big(\frac{\ell_t}{\widehat\lambda_t}-a-b(u_t-u)\Big)^{2}.
+$$
+
+`l / lam_hat` 是逐元素除，得到的数组直接当 `y` 传进 `local_linear`，所以函数体只有一行。
+
+---
+
+> 你确认 darliq.py 的逐行解读没问题之后，告诉我"继续 run_nvda"，我就把第 2 节 `run_nvda.py` 的逐行解读写出来。
