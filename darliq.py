@@ -1,11 +1,29 @@
 """
-DArLiQ model: semiparametric estimation of the Amihud illiquidity process.
+DArLiQ model
 
-Step 1  :  nonparametric trend g(t/T) by local linear kernel smoothing.
-Step 2a :  GMM / NLS estimation of theta = (beta, gamma).
-Step 2b :  Weibull maximum-likelihood estimation of (beta, gamma, k).
+Amihud illiquidity measure:
+    l_t = |R_t| / V_t
+Price impact per unit of trading volume. Larger l_t => worse liquidity.
 
-Reference: Hafner, Linton & Wang (2024), JBES 42(2), 774-785.
+DArLiQ multiplicative decomposition:
+    l_t = g(t/T) * lambda_t * zeta_t
+
+  g(t/T) : long-run trend, nonparametric (no assumed functional form),
+           E(l_t) = g(t/T).
+
+  lambda_t : short-run dynamics, analogous to the conditional variance
+             in GARCH(1, 1),
+                 lambda_t = (1 - beta - gamma) + beta * lambda_{t-1}
+                                                + gamma * l*_{t-1},
+             where omega = 1 - beta - gamma is pinned down by the
+             constraint E(lambda_t) = 1. We need this because g and
+             lambda_t are only identified up to a multiplicative
+             constant; fixing E(lambda_t) = 1 resolves this.
+
+  Detrended liquidity:
+                 l*_t = l_t / g(t/T) = lambda_t * zeta_t.
+
+  zeta_t : random shock, unpredictable, E(zeta_t | F_{t-1}) = 1.
 """
 
 import numpy as np
@@ -13,21 +31,16 @@ from scipy.optimize import minimize
 from scipy.special import gamma as gamma_func
 
 
-# -------------------------------------------------------------------------
-# kernel
-# -------------------------------------------------------------------------
 def gaussian_kernel(z):
     return np.exp(-0.5 * z ** 2) / np.sqrt(2.0 * np.pi)
 
 
-# -------------------------------------------------------------------------
-# Step 1 : nonparametric trend g(u)
-# -------------------------------------------------------------------------
 def local_linear(u_eval, u_data, y, h):
     """
     Local linear regression of y on u_data, evaluated at u_eval.
-    Reduces to the Nadaraya-Watson estimator in the interior but keeps
-    the estimate approximately unbiased at the boundary.
+    At each evaluation point u we solve
+        min_{a, b}   sum_t  K_h(u_t - u) * (y_t - a - b (u_t - u))^2
+    and return g_hat(u) = a_hat.
     """
     g_hat = np.empty_like(u_eval, dtype=float)
     for i, u in enumerate(u_eval):
@@ -42,35 +55,9 @@ def local_linear(u_eval, u_data, y, h):
     return g_hat
 
 
-def rule_of_thumb_bandwidth(y):
-    """
-    Bandwidth via a cubic log-polynomial pilot, Section 4.1.1.
-    log g(u) ~ a0 + a1 u + a2 u^2 + a3 u^3,
-    h* = (R(K) * sigma^2 / (mu2(K)^2 * mean((g''/g)^2) * T))^(1/5).
-    """
-    T = len(y)
-    u = np.arange(1, T + 1) / T
-    X = np.column_stack([np.ones(T), u, u ** 2, u ** 3])
-    a = np.linalg.lstsq(X, np.log(y), rcond=None)[0]
-
-    g_pilot = np.exp(X @ a)
-    dlog = a[1] + 2 * a[2] * u + 3 * a[3] * u ** 2        # (log g)'
-    ddlog = 2 * a[2] + 6 * a[3] * u                        # (log g)''
-    curv = dlog ** 2 + ddlog                               # g'' / g
-
-    sigma2 = np.var(y - g_pilot)
-    RK = 1.0 / (2.0 * np.sqrt(np.pi))                      # ||K||^2
-    mu2 = 1.0                                              # mu_2(K)
-    h = (RK * sigma2 / (mu2 ** 2 * np.mean(curv ** 2) * T)) ** (1.0 / 5.0)
-    return h
-
-
-# -------------------------------------------------------------------------
-# Step 2a : GMM / NLS for theta = (beta, gamma)
-# -------------------------------------------------------------------------
 def lambda_recursion(theta, l_star):
     """
-    lambda_t = (1 - beta - gamma) + beta lambda_{t-1} + gamma l*_{t-1},
+    lambda_t = (1 - beta - gamma) + beta * lambda_{t-1} + gamma * l*_{t-1},
     initialised at lambda_0 = 1, l*_0 = 1.
     """
     beta, gamma = theta
@@ -85,10 +72,11 @@ def lambda_recursion(theta, l_star):
 
 def gmm_estimate(l_star, theta0=(0.85, 0.10)):
     """
-    Minimise (1/T) * sum_t (l*_t - lambda_t(theta))^2.
-    This is GMM with the conditional-mean moment restriction
-    E(l*_t - lambda_t | F_{t-1}) = 0 and the optimal instrument under
-    conditional homoskedasticity (i.e. NLS).
+    GMM based on the first conditional moment restriction
+        E(l*_t - lambda_t(theta) | F_{t-1}) = 0,
+    with optimal instrument z_{t-1} = d lambda_t / d theta under
+    conditional homoskedasticity. Reduces to minimising the sum of
+    squared residuals.
     """
     def obj(theta):
         lam = lambda_recursion(theta, l_star)
@@ -102,9 +90,6 @@ def gmm_estimate(l_star, theta0=(0.85, 0.10)):
     return res.x
 
 
-# -------------------------------------------------------------------------
-# Step 2b : Weibull maximum likelihood
-# -------------------------------------------------------------------------
 def _weibull_logpdf(zeta, k):
     """log density of Weibull(k, scale) with scale chosen so E(zeta) = 1."""
     scale = 1.0 / gamma_func(1.0 + 1.0 / k)
@@ -113,18 +98,22 @@ def _weibull_logpdf(zeta, k):
 
 
 def neg_loglik_weibull(params, l_star):
+    """
+    Negative log-likelihood of l*_t assuming zeta_t iid Weibull(k) with
+    unit mean. With the Jacobian of zeta_t = l*_t / lambda_t,
+        p(l*_t | F_{t-1}) = (1 / lambda_t) * f_k(l*_t / lambda_t).
+    """
     beta, gamma, k = params
     lam = lambda_recursion((beta, gamma), l_star)
     zeta = l_star / lam
     log_f = _weibull_logpdf(zeta, k)
-    # density of l*_t given F_{t-1}: (1/lambda) f(l*_t / lambda)
     return -np.sum(-np.log(lam) + log_f)
 
 
 def ml_weibull_estimate(l_star, theta0, k0=1.2):
     """
-    Maximum likelihood assuming zeta_t iid Weibull(k) with unit mean.
-    Starts from the GMM point theta0 = (beta0, gamma0).
+    Maximum likelihood for (beta, gamma, k) assuming zeta_t iid Weibull(k)
+    with unit mean. Starts from the GMM point theta0 = (beta0, gamma0).
     """
     eps = 1e-4
     x0 = np.array([theta0[0], theta0[1], k0])
@@ -135,9 +124,6 @@ def ml_weibull_estimate(l_star, theta0, k0=1.2):
     return res.x, -res.fun
 
 
-# -------------------------------------------------------------------------
-# refined trend using lambda_hat
-# -------------------------------------------------------------------------
 def refined_trend(u_eval, u_data, l, lam_hat, h):
-    """Smooth l_t / lambda_hat_t : the refined trend estimator of Eq. (6)."""
+    """Refined trend: smooth l_t / lambda_hat_t instead of l_t itself."""
     return local_linear(u_eval, u_data, l / lam_hat, h)

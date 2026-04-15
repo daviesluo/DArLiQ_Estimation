@@ -1,6 +1,6 @@
 """
 Download NVDA prices and volume, build the Amihud illiquidity series
-and fit the DArLiQ model following Steps 1 and 2 of the paper.
+and fit the DArLiQ model (Steps 1 and 2).
 """
 
 import os
@@ -9,15 +9,15 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.special import gamma as gamma_func
 
-from darliq import (local_linear, rule_of_thumb_bandwidth,
-                    gmm_estimate, ml_weibull_estimate,
+from darliq import (local_linear, gmm_estimate, ml_weibull_estimate,
                     lambda_recursion, refined_trend)
 
 
 TICKER = 'NVDA'
-START = '1999-01-22'      # NVDA IPO: 1999-01-22
+START = '1999-01-22'           # NVDA IPO
 END = '2024-12-31'
 CSV_CACHE = 'nvda_raw.csv'
+BANDWIDTH = 0.03               # smoothing window ~ one month of trading days
 
 
 def _load_prices(ticker=TICKER, start=START, end=END, cache=CSV_CACHE):
@@ -40,7 +40,7 @@ def _load_prices(ticker=TICKER, start=START, end=END, cache=CSV_CACHE):
 
 
 def build_illiquidity(ticker=TICKER, start=START, end=END):
-    """Amihud daily illiquidity:  l_t = |R_t| / (P_t * V_t)."""
+    """Daily Amihud illiquidity:  l_t = |R_t| / (P_t * V_t)."""
     df = _load_prices(ticker, start, end)
     close = df['Close'].squeeze().astype(float)
     volume = df['Volume'].squeeze().astype(float)
@@ -49,8 +49,8 @@ def build_illiquidity(ticker=TICKER, start=START, end=END):
     dollar_volume = close * volume
     l = (ret.abs() / dollar_volume).dropna()
     l = l.replace([np.inf, -np.inf], np.nan).dropna()
-    l = l[l > 0]                     # drop the few zero-return days
-    return l * 1e10                  # rescale as in the paper
+    l = l[l > 0]                    # drop the few zero-return days
+    return l * 1e10                 # rescale to O(1)
 
 
 def main():
@@ -59,30 +59,21 @@ def main():
     u = np.arange(1, T + 1) / T
     y = l.values
 
-    # --------------------------------------------------------------
-    # Step 1 : initial trend
-    # --------------------------------------------------------------
-    h0 = rule_of_thumb_bandwidth(y)
-    h0_used = h0 / 2.0               # undersmoothing, Section 4.1.1
-    g_init = local_linear(u, u, y, h0_used)
+    # Step 1 : nonparametric trend
+    g_init = local_linear(u, u, y, BANDWIDTH)
     l_star = y / g_init
 
-    # --------------------------------------------------------------
-    # Step 2a : GMM on the initial detrended series
-    # --------------------------------------------------------------
+    # Step 2a : GMM on initial detrended series, refine g, GMM again
     theta_gmm0 = gmm_estimate(l_star)
     lam_gmm0 = lambda_recursion(theta_gmm0, l_star)
 
-    # refine g with l_t / lambda_hat and re-estimate theta
-    g_refined = refined_trend(u, u, y, lam_gmm0, h0_used)
+    g_refined = refined_trend(u, u, y, lam_gmm0, BANDWIDTH)
     l_star_ref = y / g_refined
     theta_gmm = gmm_estimate(l_star_ref, theta0=theta_gmm0)
     lam_gmm = lambda_recursion(theta_gmm, l_star_ref)
     zeta_gmm = l_star_ref / lam_gmm
 
-    # --------------------------------------------------------------
-    # Step 2b : Weibull ML (one re-estimation from the GMM point)
-    # --------------------------------------------------------------
+    # Step 2b : Weibull maximum likelihood from the GMM point
     (beta_ml, gamma_ml, k_ml), loglik = ml_weibull_estimate(
         l_star_ref, theta0=theta_gmm)
     lam_ml = lambda_recursion((beta_ml, gamma_ml), l_star_ref)
@@ -90,19 +81,16 @@ def main():
     sigma_zeta = np.sqrt(
         gamma_func(1 + 2 / k_ml) / gamma_func(1 + 1 / k_ml) ** 2 - 1)
 
-    # --------------------------------------------------------------
     # report
-    # --------------------------------------------------------------
     print('=' * 62)
     print(f'{TICKER}  Amihud illiquidity  (l_t x 1e10)')
-    print(f'sample : {l.index[0].date()}  to  {l.index[-1].date()}'
-          f'   T = {T}')
+    print(f'sample : {l.index[0].date()}  to  {l.index[-1].date()}  '
+          f'T = {T}')
     print(f'mean   = {y.mean():.4f}   sd = {y.std():.4f}'
           f'   skew = {pd.Series(y).skew():.3f}'
           f'   kurt = {pd.Series(y).kurt():.3f}')
     print('-' * 62)
-    print(f'bandwidth rule-of-thumb   h0 = {h0:.4f}'
-          f'   used (h0/2) = {h0_used:.4f}')
+    print(f'bandwidth h = {BANDWIDTH:.4f}')
     print('-' * 62)
     print('Step 2a  GMM  (initial trend)')
     print(f'   beta  = {theta_gmm0[0]:.4f}'
@@ -122,9 +110,7 @@ def main():
     print(f'   log-likelihood  = {loglik:.2f}')
     print('=' * 62)
 
-    # --------------------------------------------------------------
     # figures
-    # --------------------------------------------------------------
     fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
 
     axes[0].plot(l.index, np.log(y), color='grey', lw=0.5,
@@ -148,7 +134,6 @@ def main():
     plt.tight_layout()
     plt.savefig('nvda_darliq_fit.png', dpi=130)
 
-    # save the fitted series
     out = pd.DataFrame({
         'l': y,
         'g_init': g_init,
